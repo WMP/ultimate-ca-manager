@@ -195,6 +195,93 @@ class TestAcmeProxyEabNewOrder:
         assert 'Account not found' not in detail
 
 
+class TestAcmeProxyOnlyReturnExisting:
+    """RFC 8555 §7.3.1: onlyReturnExisting never creates and needs no EAB."""
+
+    _URL = 'http://localhost/acme/proxy/new-account'
+
+    def _post(self, client, jwk, private_key, payload):
+        jws = _build_jws(
+            self._URL, payload, jwk, private_key, nonce=_get_nonce(client),
+        )
+        return client.post(
+            '/acme/proxy/new-account',
+            data=json.dumps(jws),
+            content_type='application/jose+json',
+        )
+
+    def _account_count(self, app, jwk):
+        from models import AcmeAccount
+        from services.acme.jwk_thumbprint import jwk_thumbprint_or_none
+        with app.app_context():
+            return AcmeAccount.query.filter_by(
+                jwk_thumbprint=jwk_thumbprint_or_none(jwk)).count()
+
+    def test_returns_existing_account_without_eab(
+        self, app, client, proxy_protocol_upstream_stub,
+    ):
+        _set_eab_required(app, False)
+        private_key, jwk = _generate_rsa_key_and_jwk()
+        r_create = self._post(client, jwk, private_key, {'termsOfServiceAgreed': True})
+        assert r_create.status_code == 201
+        kid = r_create.headers['Location']
+
+        _set_eab_required(app, True)
+        r = self._post(client, jwk, private_key, {'onlyReturnExisting': True})
+
+        assert r.status_code == 200
+        assert r.headers['Location'] == kid
+        assert self._account_count(app, jwk) == 1
+
+        # The kid from the lookup is accepted by new-order.
+        url_order = 'http://localhost/acme/proxy/new-order'
+        jws_order = _build_jws(
+            url_order,
+            {'identifiers': [{'type': 'dns', 'value': 'test.example.com'}]},
+            jwk, private_key, nonce=_get_nonce(client), use_kid=r.headers['Location'],
+        )
+        r_order = client.post(
+            '/acme/proxy/new-order',
+            data=json.dumps(jws_order),
+            content_type='application/jose+json',
+        )
+        detail = (r_order.get_json() or {}).get('detail', '')
+        assert 'kid required' not in detail.lower()
+        assert 'Account not found' not in detail
+
+    @pytest.mark.parametrize('eab_required', [True, False])
+    def test_unknown_key_is_account_does_not_exist(
+        self, app, client, proxy_protocol_upstream_stub, eab_required,
+    ):
+        _set_eab_required(app, eab_required)
+        private_key, jwk = _generate_rsa_key_and_jwk()
+
+        r = self._post(client, jwk, private_key, {'onlyReturnExisting': True})
+
+        assert r.status_code == 400
+        err_type = r.get_json()['type']
+        assert err_type.endswith('accountDoesNotExist')
+        assert not err_type.endswith('externalAccountRequired')
+        assert self._account_count(app, jwk) == 0
+
+    @pytest.mark.parametrize('payload', [
+        {},
+        {'termsOfServiceAgreed': True},
+        {'onlyReturnExisting': False},
+    ])
+    def test_eab_gate_still_applies_without_only_return_existing(
+        self, app, client, proxy_protocol_upstream_stub, payload,
+    ):
+        _set_eab_required(app, True)
+        private_key, jwk = _generate_rsa_key_and_jwk()
+
+        r = self._post(client, jwk, private_key, payload)
+
+        assert r.status_code == 400
+        assert r.get_json()['type'].endswith('externalAccountRequired')
+        assert self._account_count(app, jwk) == 0
+
+
 class TestAcmeProxyCertOrderBinding:
     def test_find_order_for_certificate_matches_upstream_cert_url(self, app, monkeypatch):
         from services.acme.acme_proxy_service import AcmeProxyService

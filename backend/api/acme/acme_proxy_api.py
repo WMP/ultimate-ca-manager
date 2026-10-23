@@ -343,6 +343,26 @@ def new_account(slug=None):
     if not jwk:
         return proxy_error("malformed", "Missing JWK in protected header")
 
+    # onlyReturnExisting (RFC 8555 §7.3.1): never creates an account and needs
+    # no EAB; clients such as cert-manager use it to fetch their kid.
+    if isinstance(payload, dict) and payload.get('onlyReturnExisting'):
+        from models import AcmeAccount
+        thumbprint = jwk_thumbprint_or_none(jwk)
+        existing = (
+            AcmeAccount.query.filter_by(jwk_thumbprint=thumbprint).first()
+            if thumbprint else None
+        )
+        if not existing:
+            return proxy_error('accountDoesNotExist', 'Account does not exist', 400)
+        acct_url = f"{_proxy_base_url(slug)}/acct/{existing.account_id}"
+        resp = proxy_response({
+            "status": existing.status,
+            "contact": existing.contact_list,
+            "orders": f"{acct_url}/orders"
+        }, 200)
+        resp.headers['Location'] = acct_url
+        return resp
+
     eab_data = payload.get('externalAccountBinding') if isinstance(payload, dict) else None
     eab_cfg = SystemConfig.query.filter_by(key='acme_eab_required').first()
     eab_required = (eab_cfg.value if eab_cfg else 'false').lower() == 'true'
