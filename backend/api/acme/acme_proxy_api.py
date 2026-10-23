@@ -331,6 +331,18 @@ def new_nonce(slug=None):
     return resp
 
 
+def _account_response(account, slug, status_code):
+    """Account object (RFC 8555 §7.1.2) with its URL in Location."""
+    acct_url = f"{_proxy_base_url(slug)}/acct/{account.account_id}"
+    resp = proxy_response({
+        "status": account.status,
+        "contact": account.contact_list,
+        "orders": f"{acct_url}/orders"
+    }, status_code)
+    resp.headers['Location'] = acct_url
+    return resp
+
+
 @_dual_route('/new-account', methods=['POST'], endpoint='proxy_new_account')
 def new_account(slug=None):
     """New account (RFC 8555 §7.3)"""
@@ -344,24 +356,28 @@ def new_account(slug=None):
         return proxy_error("malformed", "Missing JWK in protected header")
 
     # onlyReturnExisting (RFC 8555 §7.3.1): never creates an account and needs
-    # no EAB; clients such as cert-manager use it to fetch their kid.
-    if isinstance(payload, dict) and payload.get('onlyReturnExisting'):
-        from models import AcmeAccount
-        thumbprint = jwk_thumbprint_or_none(jwk)
-        existing = (
-            AcmeAccount.query.filter_by(jwk_thumbprint=thumbprint).first()
-            if thumbprint else None
-        )
+    # no EAB; clients such as cert-manager use it to fetch their kid. The field
+    # is a boolean, so only `true` counts.
+    if isinstance(payload, dict) and payload.get('onlyReturnExisting') is True:
+        try:
+            from models import AcmeAccount
+            thumbprint = jwk_thumbprint_or_none(jwk)
+            existing = (
+                AcmeAccount.query.filter_by(jwk_thumbprint=thumbprint).first()
+                if thumbprint else None
+            )
+        except Exception as e:
+            logger.error(f"ACME proxy account lookup error: {e}")
+            return proxy_error("serverInternal", "Failed to look up account", 500)
         if not existing:
             return proxy_error('accountDoesNotExist', 'Account does not exist', 400)
-        acct_url = f"{_proxy_base_url(slug)}/acct/{existing.account_id}"
-        resp = proxy_response({
-            "status": existing.status,
-            "contact": existing.contact_list,
-            "orders": f"{acct_url}/orders"
-        }, 200)
-        resp.headers['Location'] = acct_url
-        return resp
+        if existing.status in _CLOSED_ACCOUNT_STATUSES:
+            return proxy_error(
+                'unauthorized',
+                f'This ACME account is closed (status: {existing.status})',
+                401,
+            )
+        return _account_response(existing, slug, 200)
 
     eab_data = payload.get('externalAccountBinding') if isinstance(payload, dict) else None
     eab_cfg = SystemConfig.query.filter_by(key='acme_eab_required').first()
@@ -401,17 +417,7 @@ def new_account(slug=None):
             except Exception as e:
                 logger.warning(f"Could not mark EAB credential used: {e}")
 
-        acct_url = f"{_proxy_base_url(slug)}/acct/{account.account_id}"
-
-        resp_data = {
-            "status": account.status,
-            "contact": account.contact_list,
-            "orders": f"{acct_url}/orders"
-        }
-
-        resp = proxy_response(resp_data, 201 if is_new else 200)
-        resp.headers['Location'] = acct_url
-        return resp
+        return _account_response(account, slug, 201 if is_new else 200)
     except Exception as e:
         logger.error(f"ACME proxy new-account error: {e}")
         return proxy_error("serverInternal", "Failed to create account", 500)

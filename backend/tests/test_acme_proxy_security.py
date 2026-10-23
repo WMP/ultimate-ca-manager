@@ -68,6 +68,19 @@ def _build_jws(url, payload, jwk, private_key, nonce='test-nonce', use_kid=None)
     return {'protected': protected_b64, 'payload': payload_b64, 'signature': sig_b64}
 
 
+def _post_new_order(client, jwk, private_key, kid):
+    jws_order = _build_jws(
+        'http://localhost/acme/proxy/new-order',
+        {'identifiers': [{'type': 'dns', 'value': 'test.example.com'}]},
+        jwk, private_key, nonce=_get_nonce(client), use_kid=kid,
+    )
+    return client.post(
+        '/acme/proxy/new-order',
+        data=json.dumps(jws_order),
+        content_type='application/jose+json',
+    )
+
+
 @pytest.fixture(autouse=True)
 def _drop_orders_created_here(app):
     """Orders a test creates leave with it: later suites check FK integrity."""
@@ -177,22 +190,13 @@ class TestAcmeProxyEabNewOrder:
 
         _set_eab_required(app, True)
 
-        nonce2 = _get_nonce(client)
-        url_order = 'http://localhost/acme/proxy/new-order'
-        payload_order = {'identifiers': [{'type': 'dns', 'value': 'test.example.com'}]}
-        jws_order = _build_jws(
-            url_order, payload_order, jwk, private_key, nonce=nonce2, use_kid=kid,
-        )
-        r_order = client.post(
-            '/acme/proxy/new-order',
-            data=json.dumps(jws_order),
-            content_type='application/jose+json',
-        )
+        r_order = _post_new_order(client, jwk, private_key, kid)
 
         detail = (r_order.get_json() or {}).get('detail', '')
         assert 'Missing JWK' not in detail
         assert 'kid required' not in detail.lower()
         assert 'Account not found' not in detail
+        assert 'No DNS provider configured' in detail  # past the kid check
 
 
 class TestAcmeProxyOnlyReturnExisting:
@@ -234,20 +238,11 @@ class TestAcmeProxyOnlyReturnExisting:
         assert self._account_count(app, jwk) == 1
 
         # The kid from the lookup is accepted by new-order.
-        url_order = 'http://localhost/acme/proxy/new-order'
-        jws_order = _build_jws(
-            url_order,
-            {'identifiers': [{'type': 'dns', 'value': 'test.example.com'}]},
-            jwk, private_key, nonce=_get_nonce(client), use_kid=r.headers['Location'],
-        )
-        r_order = client.post(
-            '/acme/proxy/new-order',
-            data=json.dumps(jws_order),
-            content_type='application/jose+json',
-        )
+        r_order = _post_new_order(client, jwk, private_key, r.headers['Location'])
         detail = (r_order.get_json() or {}).get('detail', '')
         assert 'kid required' not in detail.lower()
         assert 'Account not found' not in detail
+        assert 'No DNS provider configured' in detail  # past the kid check
 
     @pytest.mark.parametrize('eab_required', [True, False])
     def test_unknown_key_is_account_does_not_exist(
@@ -279,6 +274,66 @@ class TestAcmeProxyOnlyReturnExisting:
 
         assert r.status_code == 400
         assert r.get_json()['type'].endswith('externalAccountRequired')
+        assert self._account_count(app, jwk) == 0
+
+
+    @pytest.mark.parametrize('status', ['deactivated', 'revoked'])
+    def test_closed_account_is_unauthorized(
+        self, app, client, proxy_protocol_upstream_stub, status,
+    ):
+        from models import AcmeAccount
+        from services.acme.jwk_thumbprint import jwk_thumbprint_or_none
+        _set_eab_required(app, False)
+        private_key, jwk = _generate_rsa_key_and_jwk()
+        r_create = self._post(client, jwk, private_key, {'termsOfServiceAgreed': True})
+        assert r_create.status_code == 201
+        with app.app_context():
+            acct = AcmeAccount.query.filter_by(
+                jwk_thumbprint=jwk_thumbprint_or_none(jwk)).first()
+            acct.status = status
+            db.session.commit()
+
+        r = self._post(client, jwk, private_key, {'onlyReturnExisting': True})
+
+        assert r.status_code == 401
+        assert r.get_json()['type'].endswith('unauthorized')
+        assert 'Location' not in r.headers
+
+    @pytest.mark.parametrize('flag', ['true', 1, ['x']])
+    def test_non_boolean_flag_is_not_a_lookup(
+        self, app, client, proxy_protocol_upstream_stub, flag,
+    ):
+        payload = {'onlyReturnExisting': flag, 'termsOfServiceAgreed': True}
+
+        _set_eab_required(app, True)
+        private_key, jwk = _generate_rsa_key_and_jwk()
+        r = self._post(client, jwk, private_key, payload)
+        assert r.status_code == 400
+        assert r.get_json()['type'].endswith('externalAccountRequired')
+        assert self._account_count(app, jwk) == 0
+
+        _set_eab_required(app, False)
+        r = self._post(client, jwk, private_key, payload)
+        assert r.status_code == 201
+        assert self._account_count(app, jwk) == 1
+
+    def test_lookup_database_error_is_server_internal(
+        self, app, client, proxy_protocol_upstream_stub, monkeypatch,
+    ):
+        from api.acme import acme_proxy_api
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError('db down')
+
+        monkeypatch.setattr(acme_proxy_api, 'jwk_thumbprint_or_none', _boom)
+        _set_eab_required(app, True)
+        private_key, jwk = _generate_rsa_key_and_jwk()
+
+        r = self._post(client, jwk, private_key, {'onlyReturnExisting': True})
+
+        assert r.status_code == 500
+        assert r.headers['Content-Type'].startswith('application/problem+json')
+        assert r.get_json()['type'].endswith('serverInternal')
         assert self._account_count(app, jwk) == 0
 
 
