@@ -268,7 +268,7 @@ Test name: `test_<ID>_<description>_pos` / `test_<ID>_<description>_neg`.
 |---|---|---|---|---|
 | U1 | ZOCOUNT ≠ 1 or ZTYPE ≠ SOA → FORMERR | 2136 §3.1.1 | 1 × SOA → continue | 0, 2 records; ZTYPE=A → FORMERR |
 | U2 | ZCLASS ≠ IN → NOTAUTH | 2136 §3.1.1 | IN → continue | CH, ANY → NOTAUTH |
-| U3 | ZNAME outside our zones → NOTAUTH | 2136 §3.1.1 | domain from ACME Domains; its ancestor (public apex, cert-manager and win-acme pattern) → continue | foreign zone; descendant of a domain; root; TLD → NOTAUTH |
+| U3 | ZNAME outside our zones → NOTAUTH | 2136 §3.1.1 | domain from ACME Domains; its ancestor (public apex, cert-manager and win-acme pattern) → continue | foreign zone; root; TLD → NOTAUTH (a name below a domain: U16, since the review of #418) |
 | U4 | UPDATE without a signature → REFUSED at once (before U1–U3), application log only | 3007 §2, §3; 2136 §3.3.1 | the same UPDATE signed → NOERROR | without TSIG → REFUSED, no audit entry, no changes; the response for a zone from ACME Domains and for a foreign zone is identical byte for byte (except the ID); 0 DB queries (F6) |
 | U5 | Non-empty prerequisite section → REFUSED | 2136 §2.4, §3.3; maintainer | empty → continue | each of the 5 forms (§2.4.1–§2.4.5) → REFUSED |
 | U6 | RR class ∉ {IN, ANY, NONE} → FORMERR | 2136 §3.4.1 | IN, ANY, NONE → continue | CH → FORMERR |
@@ -276,11 +276,13 @@ Test name: `test_<ID>_<description>_pos` / `test_<ID>_<description>_neg`.
 | U8 | Prescan: IN with type ANY/AXFR/MAILA/MAILB → FORMERR; ANY with TTL≠0 or RDLENGTH≠0 → FORMERR; NONE with TTL≠0 → FORMERR | 2136 §3.4.1.2 | valid forms → continue | each invalid form → FORMERR |
 | U9 | Only TXT under `_acme-challenge.<identifier>` can be changed | 3007 §3, §3.1; 8555 §8.4 | TXT under the challenge name → continue | A under this name; TXT under `foo.<id>`; CNAME → REFUSED |
 | U10 | Add needs an active value in the key scope; values are compared after joining the TXT strings, exact match | 3007 §3; 8555 §8.4; 1035 §3.3.14 | exact value; value in 2 strings → NOERROR | 1 character different; row of another proxy account; another ACME account with a key linked to EAB; expired row; closed row → REFUSED |
-| U11 | Delete of TXT (class NONE and class ANY) → NOERROR, no changes, also after the order ends; ANY/ANY → REFUSED | 2136 §2.5.2, §2.5.4, §3.4.2.3–§3.4.2.4; 3007 §3.1; maintainer | NONE TXT, ANY TXT, order ended → NOERROR | ANY/ANY; delete of A → REFUSED |
+| U11 | Delete of TXT (class NONE and class ANY) → NOERROR, no changes, also after the order ends (ANY/ANY: U17) | 2136 §2.5.2, §2.5.4, §3.4.2.3–§3.4.2.4; 3007 §3.1; maintainer | NONE TXT, ANY TXT, order ended → NOERROR | delete of A → REFUSED |
 | U12 | Atomicity: one bad RR rejects the whole message, no effects | 2136 §3.3.2, §3.7 | [delete ANY TXT, add valid] (lego/cert-manager pattern) → NOERROR | [delete, add bad] → REFUSED, no `client_confirmed_at`, audit "refused" |
 | U13 | Adding the same value again → NOERROR | 2136 §2.5.1 | second identical UPDATE → NOERROR | — (pair with U10 N) |
 | U14 | Response: ID and opcode copied, QR=1, section counters = 0 | 2136 §3.8 | header check | the response never contains the update section of the request |
 | U15 | An accepted UPDATE does not change DNS through the listener; it sets `client_confirmed_at`, `last_used_at`, audit | maintainer; 2136 §3.5 (no state to persist) | accepted → fields set, DNS provider calls 0 | rejected → fields empty |
+| U16 | ZNAME below a domain from ACME Domains → continue; every record must be in the zone (review of #418) | 2136 §3.1.1, §3.4.1.3 | zone `app.example.com`, entry `example.com`, add at `_acme-challenge.app.example.com` → NOERROR | record outside the zone → NOTZONE; zone below a foreign domain → NOTAUTH |
+| U17 | Delete of all RRsets of a name (class ANY, type ANY) at `_acme-challenge.<name>` → NOERROR, no changes (review of #418) | 2136 §2.5.3, §3.4.1.3, §3.4.2.3 | `update delete _acme-challenge.x.example.com` → NOERROR, counted as a delete | type ANY with class NONE or IN; ANY/ANY at another name → REFUSED; class ANY with RDLENGTH ≠ 0 → FORMERR |
 
 ### 4.4 QUERY and SOA discovery (Q)
 
@@ -293,6 +295,7 @@ Test name: `test_<ID>_<description>_pos` / `test_<ID>_<description>_neg`.
 | Q5 | Meta types (AXFR, IXFR, ANY) → REFUSED | 1035 §4.1.1; 8906 §3.1.2 | — | each meta type → REFUSED |
 | Q6 | Names are compared case-insensitively | 1034 §3.1 | `_ACME-Challenge.Example.COM.` → response | another name → REFUSED |
 | Q7 | SOA for a name between D and record_name (including record_name) → NOERROR, AA=1, ANSWER empty, SOA(D) in AUTHORITY | 2308 §2.2, §3 | nsupdate: SOA for `_acme-challenge.<id>` → zone D; certbot and lego: the walk up ends at D | a name under D without an active row → REFUSED |
+| Q8 | Q1 and Q7 also for a row up to 24 h after its `expires_at`, whatever its status (failed validation, certificate downloaded); an add still needs an active row (review of #418) | 2136 §3.1.1 (clients find the zone again for the cleanup) | closed row → SOA answered (Q1, Q7 forms); signed query: rows of the key scope only | row 25 h after `expires_at` → REFUSED; add with the value of a closed row → REFUSED |
 
 ### 4.5 Expected values (R) and keys (K)
 
@@ -300,11 +303,13 @@ Test name: `test_<ID>_<description>_pos` / `test_<ID>_<description>_neg`.
 |---|---|---|---|---|
 | R1 | Value = base64url(SHA-256(token "." thumbprint)), without `=` | 8555 §8.1, §8.4; 4648 §5; 7638 §3 | vector from RFC 7638 §3.1 and a test token, result computed independently by `hashlib` | the result contains no `=`, `+`, `/` |
 | R2 | Record name = `_acme-challenge.` + identifier without `*.` | 8555 §7.1.4, §8.4 | `*.example.com` → `_acme-challenge.example.com.` | never `_acme-challenge.*.example.com` |
-| R3 | Write when authz is fetched, for the order and its siblings | 8555 §7.5; #307 | `pending` authz with dns-01 → rows for all orders | `valid` authz (#325); foreign client (403); no dns-01 → no rows |
+| R3 | Write when authz is fetched, for the order and its siblings | 8555 §7.5; #307 | `pending` authz with dns-01 → rows for all orders (also while `processing`: R9) | `valid` authz (#325); foreign client (403); no dns-01 → no rows |
 | R4 | Closing at `get_certificate` and at a final error state of authz/challenge; `expires_at` ≤ creation + 24 h | 8555 §7.1.4 (`expires`), §7.1.6 | after the certificate → `closed`; authz or challenge `invalid` → `closed` | row of another order unchanged; `processing` and `valid` → the row stays `pending` (race with the UCM automation); authz `expires` in 7 days → `expires_at` = +24 h |
 | R5 | Key scope: proxy account, optionally the ACME account with EAB | 3007 §3, §3.1 | match → allowed | another proxy account; another ACME account → not allowed |
 | R6 | A row write error (for example a UNIQUE conflict with parallel `get_authz`) does not stop `get_authz` and does not roll back `challenges_data` | consistency | two parallel `get_authz` of siblings → both OK, rows without duplicates | forced IntegrityError → `get_authz` returns the authz, the state `initiated` stays |
 | R7 | The row of a sibling has the thumbprint and `account_id` of the sibling; an order without a thumbprint has no row | 8555 §8.1; #307 | 2 accounts, shared authz → 2 rows with different values | order with `client_jwk_thumbprint` NULL → no row |
+| R8 | The snapshot has two views: active rows (adds) and rows up to 24 h after `expires_at` (SOA discovery, Q8); one query (review of #418) | consistency | closed row, row of a `valid` order, row 23 h after `expires_at` → SOA view only | row 25 h after `expires_at` → in neither view |
+| R9 | Write also while the challenge is `processing` (authz `pending`): a sibling that fetches the authz after the automation started gets its row (review of #418) | 8555 §7.1.6; #307 | authz `pending`, challenge `pending` or `processing` → row | challenge or authz `valid`, `invalid` → no row; `processing` starts no automation |
 | K1 | Secret from a CSPRNG, length = digest output (32/48/64 B) | 8945 §8 | lengths for 3 algorithms | two keys never have the same secret (1000 trials) |
 | K2 | Secret encrypted in the DB | maintainer | value in the DB ≠ plain text, read through the model = plain text | wrong master key → no read |
 | K3 | Secret returned only at creation | maintainer | POST returns the secret | GET of the list and GET of the key do not return the secret |
@@ -560,4 +565,21 @@ Round 3 of `/security-review`: no vulnerability with confidence ≥ 0.7. Hardeni
 - TTL of the TSIG record other than 0 → FORMERR (RFC 8945 §4.2: "TTL: This MUST be 0"). dnspython always writes the TTL of the TSIG record as 0, and the MAC does not cover it, so the check reads the message bytes (S1).
 - A message with TSIG whose header ID differs from Original ID is read a second time in the signed form (with Original ID, RFC 8945 §4.3.2). When the content differs (a name compressed with a pointer to the header, RFC 1035 §4.1.4 allows only a pointer to an earlier name) → FORMERR before the TSIG check (S1).
 Notes unchanged: the zone accepts public suffixes as ancestors (F15; the scope of rows decides, the effect is only NOTAUTH/REFUSED); pushing an entry out of the replay cache by a key holder (idempotent effects); unsigned SOA queries show the names of pending challenges (F14, internal network only).
+
+## 13. Maintainer review of PR 2 (#418)
+
+The maintainer accepted both deviations (signed SOA answers, the UDP size rule), the early REFUSED for an unsigned UPDATE and the fixed SOA content, and asked for these changes before the merge. Everything was done in one round; `dev` (with #417 and the fix of #420) was merged into the branch first.
+
+| # | Request | Result |
+|---|---|---|
+| 1 | The listener does not survive `systemctl reload`: the new worker binds while the old one holds the port | `start_dns_update_server(app, retry_for)`: on `EADDRINUSE` a greenlet retries with a backoff (0.25 s, doubling, at most 4 s) for `graceful_timeout` + 5 s; one warning, no error. Lab: after HUP the listener was up again after 4 attempts (2 s) |
+| 2 | SOA discovery after the rows close: REFUSED; maybe cert-manager stays stuck on its finalizer | Checked in the lab before the fix. cert-manager does not ask UCM for the SOA: it finds the zone through its recursive resolvers (`pkg/issuer/acme/dns/dns.go`, `prepareChallengeRequest`) and passes it to the rfc2136 provider (`provider.go`, `CleanUp` with `ResolvedZone`); its REMOVE got NOERROR after the rows closed. lego keeps the SOA for its Refresh value (`challenge/dns01/nameserver.go`) and did not ask again. certbot (`Unable to determine base domain`) and acme.sh with `nsupdate` (`REFUSED`, `Error removing txt`) failed their cleanup after a failed validation. Fix: Q8, R8 (24 h after `expires_at`). After the fix both clean up. The SOA TTL stays 0 |
+| 3 | RBAC tests prove little (viewer only) | Tests with the auditor role (GET 200, POST and DELETE 403, PATCH of the port 403) and with a custom role with `write:acme` only (DELETE 403). Mutation of each decorator makes a test fail |
+| 4 | Tests that read the source (`ast` over `gunicorn_config.py`, regex over `entrypoint.sh`) | `post_worker_init` is called with a fake worker; the port check is the function `check_dns_update_port` in `docker/dns-update-port.sh` (copied next to `/entrypoint.sh`), which the tests source and call; the entrypoint itself is run with a bad port (stops in validation, before any write) |
+| 5 | CHANGELOG: one or two sentences | Done with the text of the maintainer |
+| — | One documentation line about the 128-connection TCP pool | Admin Guide and the client guide |
+
+Smaller points, all done: zone section below an entry (U16); delete of type ANY (U17); sibling orders while the challenge is processing (R9); the keys of an account whose proxy is off are shown in the UI with a warning and can be revoked or deleted (`dns_update_key_count` in the account list, one grouped query); table names of the migration test from `__tablename__`; the replay docstrings say what the handler does (same transport: the stored response with the new header ID; other transport: processed again against the current snapshot without side effects).
+
+Found in the lab, not part of the listener: after a failed validation lego tries to deactivate the authorization (RFC 8555 §7.5.2, POST with `{"status": "deactivated"}`); the proxy accepts only POST-as-GET on the authorization URL and answers `malformed`. lego only logs it.
 
